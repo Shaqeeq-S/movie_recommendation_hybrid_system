@@ -1,4 +1,6 @@
 streamlit
 joblib
 pandas
+requests
 scikit-learn
+scikit-surprise
