@@ -1,2 +1,2 @@
 # movie_recommendation_hybrid_system
-I've built an Hybrid Recommendation System that recommend top N items to the users and since the data is sparse I've used Matrix factorization to decompose the data into user and item matrices with hundred latent factors
+I built a Hybrid Recommendation System designed to deliver personalized Top-N item recommendations. To overcome the challenge of high data sparsity, I implemented Matrix Factorization (SVD) to decompose the interaction data into dense user and item matrices using 100 latent factors. Additionally, the system leverages a content-based fallback mechanism to seamlessly handle the new-user cold-start problem.
