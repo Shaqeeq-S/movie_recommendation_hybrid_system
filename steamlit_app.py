@@ -110,6 +110,59 @@ html, body, [data-testid="stAppViewContainer"] {
     color: #aaaacc;
     margin-bottom: 1.2rem;
 }
+
+/* ── Search UI ── */
+.search-result-item {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    background: #1a1a2e;
+    border: 1px solid #2a2a4a;
+    border-radius: 12px;
+    padding: 12px 14px;
+    margin-bottom: 10px;
+    cursor: pointer;
+    transition: border-color 0.2s, background 0.2s;
+}
+.search-result-item:hover {
+    border-color: #e94560;
+    background: #1e1e38;
+}
+.search-result-thumb {
+    width: 52px; height: 76px;
+    border-radius: 8px;
+    object-fit: cover;
+    background: #0d0d1a;
+    flex-shrink: 0;
+}
+.search-result-info { flex: 1; min-width: 0; }
+.search-result-title {
+    font-size: 0.92rem; font-weight: 700;
+    color: #ffffff; margin-bottom: 4px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.search-result-meta {
+    font-size: 0.74rem; color: #8888aa;
+    display: flex; gap: 8px; flex-wrap: wrap;
+}
+.search-tag {
+    border-radius: 20px; padding: 2px 8px;
+    font-size: 0.68rem; font-weight: 600;
+}
+.tag-imdb  { background: #f5a623; color: #000; }
+.tag-yr    { background: #2a2a4a; color: #aaaaee; }
+.tag-genre-s { background: #1e2a4a; color: #7fa8ff; }
+.similar-header {
+    font-size: 1.1rem; font-weight: 700;
+    color: #f5a623;
+    margin: 18px 0 10px 0;
+    border-left: 4px solid #f5a623;
+    padding-left: 10px;
+}
+.no-results-box {
+    text-align: center; padding: 40px 20px;
+    color: #555577; font-size: 0.9rem;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -386,6 +439,173 @@ def recommend_cold_start(
 
 
 # ── ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ──
+#  YEAR EXTRACTION HELPER
+# ── ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ──
+
+import re as _re
+
+def extract_year_from_title(title: str) -> int | None:
+    """Extracts the 4-digit year embedded in a MovieLens title like 'Toy Story (1995)'."""
+    match = _re.search(r"\((\d{4})\)", str(title))
+    return int(match.group(1)) if match else None
+
+
+# ── ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ──
+#  SEARCH + FILTER ENGINE
+# ── ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ──
+
+def search_movies(
+    movies_df: pd.DataFrame,
+    query: str,
+    genres: list[str],
+    year_min: int,
+    year_max: int,
+    min_imdb: float,
+    max_results: int = 24,
+) -> pd.DataFrame:
+    """
+    Filters movies_df by title keyword, genre(s), year range, and minimum IMDb rating.
+    IMDb rating is fetched live via OMDb (cached). Falls back gracefully if API unavailable.
+    """
+    df = movies_df.copy()
+
+    # Title keyword filter
+    if query.strip():
+        df = df[df["title"].str.contains(query.strip(), case=False, na=False)]
+
+    # Genre filter
+    if genres:
+        def has_genre(g_str):
+            if pd.isna(g_str):
+                return False
+            movie_genres = set(g_str.split("|"))
+            return any(g in movie_genres for g in genres)
+        df = df[df["genres"].apply(has_genre)]
+
+    # Year filter (extracted from title)
+    df["_year"] = df["title"].apply(extract_year_from_title)
+    df = df[df["_year"].between(year_min, year_max, inclusive="both") | df["_year"].isna()]
+
+    # Limit before expensive IMDb fetch
+    df = df.head(max_results * 3)
+
+    # IMDb rating filter (only if API key set and user raised threshold)
+    if min_imdb > 0.0 and OMDB_API_KEY and OMDB_API_KEY != "YOUR_OMDB_KEY_HERE":
+        def get_imdb(title):
+            try:
+                return float(fetch_movie_details(title)["imdb_rating"])
+            except Exception:
+                return 0.0
+        df["_imdb"] = df["title"].apply(get_imdb)
+        df = df[df["_imdb"] >= min_imdb]
+    else:
+        df["_imdb"] = 0.0
+
+    return df.head(max_results).reset_index(drop=True)
+
+
+# ── ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ──
+#  SIMILAR MOVIES BY ITEM VECTOR (model-level, no user needed)
+# ── ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ──
+
+def recommend_similar_to_movie(
+    model: SVD,
+    movies_df: pd.DataFrame,
+    movie_id: int,
+    top_n: int = 8,
+) -> pd.DataFrame:
+    """
+    Finds movies whose SVD item latent vectors (qi) are closest to the given movie.
+    Works without any user context — purely content/collaborative item vectors.
+    """
+    trainset = model.trainset
+    try:
+        target_inner = trainset.to_inner_iid(movie_id)
+    except ValueError:
+        return pd.DataFrame()
+
+    item_vectors = model.qi
+    target_vec = item_vectors[target_inner]
+
+    sims = []
+    for inner_iid in range(trainset.n_items):
+        if inner_iid == target_inner:
+            continue
+        sim = compute_cosine_similarity(target_vec, item_vectors[inner_iid])
+        sims.append((inner_iid, sim))
+
+    sims.sort(key=lambda x: x[1], reverse=True)
+    top_raw_ids = [trainset.to_raw_iid(x[0]) for x in sims[:top_n]]
+
+    result = movies_df[movies_df["movieId"].isin(top_raw_ids)].copy()
+    result["predicted_score"] = None
+    return result.reset_index(drop=True)
+
+
+# ── ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ──
+#  SEARCH RESULT ROW RENDERER
+# ── ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ──
+
+def render_search_result_row(row: pd.Series, details: dict, idx: int) -> None:
+    """
+    Renders a compact horizontal search result card with poster thumbnail,
+    metadata tags, and a 'View Recommendations' button.
+    """
+    genres_html = " ".join(
+        f'<span class="search-tag tag-genre-s">{html.escape(g)}</span>'
+        for g in (row["genres"] or "").split("|")
+        if g and g.lower() != "(no genres listed)"
+    ) if isinstance(row.get("genres"), str) else ""
+
+    imdb_val = details.get("imdb_rating", "N/A")
+    imdb_html = f'<span class="search-tag tag-imdb">⭐ IMDb {html.escape(str(imdb_val))}</span>' if imdb_val != "N/A" else ""
+    year_html = f'<span class="search-tag tag-yr">📅 {html.escape(str(details["year"]))}</span>' if details.get("year") != "N/A" else ""
+
+    safe_title  = html.escape(str(row["title"]))
+    safe_plot   = html.escape(str(details.get("description", "Plot unavailable."))[:120]) + "…"
+    safe_poster = details.get("poster_url", PLACEHOLDER_POSTER)
+    safe_ph     = html.escape(PLACEHOLDER_POSTER, quote=True)
+    safe_dir    = html.escape(str(details.get("director", ""))) if details.get("director") not in ("N/A", None) else ""
+
+    row_html = f"""
+    <!DOCTYPE html><html><head>
+    <style>
+      body {{ margin:0; padding:0; background:transparent; font-family:sans-serif; }}
+      .sri {{
+        display:flex; align-items:flex-start; gap:14px;
+        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+        border:1px solid #2a2a4a; border-radius:12px;
+        padding:12px 14px; box-sizing:border-box;
+      }}
+      .thumb {{ width:52px; height:76px; border-radius:8px; object-fit:cover; background:#0d0d1a; flex-shrink:0; }}
+      .info {{ flex:1; min-width:0; }}
+      .ttl {{ font-size:0.9rem; font-weight:700; color:#fff; margin-bottom:4px;
+               white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+      .meta {{ display:flex; gap:6px; flex-wrap:wrap; margin:4px 0; }}
+      .tag {{ border-radius:20px; padding:2px 8px; font-size:0.68rem; font-weight:600; }}
+      .timdb {{ background:#f5a623; color:#000; }}
+      .tyr   {{ background:#2a2a4a; color:#aaaaee; }}
+      .tg    {{ background:#1e2a4a; color:#7fa8ff; }}
+      .plot  {{ font-size:0.73rem; color:#888899; margin-top:4px; line-height:1.4; }}
+      .dir   {{ font-size:0.68rem; color:#666688; margin-top:3px; }}
+    </style></head><body>
+    <div class="sri">
+      <img class="thumb" src="{safe_poster}" onerror="this.src='{safe_ph}'" alt="poster">
+      <div class="info">
+        <div class="ttl">{safe_title}</div>
+        <div class="meta">
+          {imdb_html}{year_html}{genres_html}
+        </div>
+        <div class="plot">{safe_plot}</div>
+        {'<div class="dir">🎬 Dir: ' + safe_dir + '</div>' if safe_dir else ''}
+      </div>
+    </div>
+    </body></html>
+    """
+    components.html(row_html, height=108, scrolling=False)
+
+
+# ── ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ──
 #  CARD RENDERER
 # ── ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ──
 
@@ -526,8 +746,13 @@ def main():
     st.markdown('<h1 class="hero-title">🎬 CineMatch</h1>', unsafe_allow_html=True)
     st.markdown(
         '<p class="hero-sub">Hybrid Movie Recommendation Engine — '
-        'Collaborative Filtering · Content-Based · Neighborhood Similarities</p>',
+        'Collaborative Filtering · Content-Based · Neighborhood Similarities · Movie Search</p>',
         unsafe_allow_html=True,
+    )
+
+    # ── Top-level page tabs ──────────────────────────────────────────────
+    page_tab_discover, page_tab_search = st.tabs(
+        ["🚀 Discover & Recommend", "🔍 Search Movies"]
     )
 
     with st.sidebar:
@@ -575,66 +800,183 @@ def main():
         st.markdown("---")
         discover_btn = st.button("🚀 Discover Movies")
 
-    if not discover_btn:
-        st.markdown("""
-        <div class="info-box">
-            👈 <b>Use the sidebar</b> to select your preferences, then click
-            <b>Discover Movies</b> to get personalized recommendations.
-            <br><br>
-            🎟️ <b>Existing Users</b> — enter your User ID for full collaborative predictions alongside item and user neighborhood matches.<br>
-            🆕 <b>New Users</b> — pick genres you love and we'll resolve the cold-start issue using metadata profiling.
-        </div>
-        """, unsafe_allow_html=True)
-        return
+    # ══════════════════════════════════════════════════════════════════════
+    #  TAB 1 — DISCOVER & RECOMMEND  (existing logic, unchanged)
+    # ══════════════════════════════════════════════════════════════════════
+    with page_tab_discover:
+        if not discover_btn:
+            st.markdown("""
+            <div class="info-box">
+                👈 <b>Use the sidebar</b> to select your preferences, then click
+                <b>Discover Movies</b> to get personalized recommendations.
+                <br><br>
+                🎟️ <b>Existing Users</b> — enter your User ID for full collaborative predictions alongside item and user neighborhood matches.<br>
+                🆕 <b>New Users</b> — pick genres you love and we'll resolve the cold-start issue using metadata profiling.
+            </div>
+            """, unsafe_allow_html=True)
 
-    with st.spinner("🔍 Calculating recommendations & fetching movie media…"):
-        if not is_new_user:
-            # Generate predictions for all three existing user contexts
-            recs_cf = recommend_for_existing_user(model, movies_df, user_id_input, top_n)
-            recs_sim_users = recommend_via_similar_users(model, movies_df, user_id_input, top_n)
-            recs_sim_items, favorite_title = recommend_similar_items(model, movies_df, user_id_input, top_n)
+        else:  # discover_btn pressed
+            with st.spinner("🔍 Calculating recommendations & fetching movie media…"):
+                if not is_new_user:
+                    recs_cf = recommend_for_existing_user(model, movies_df, user_id_input, top_n)
+                    recs_sim_users = recommend_via_similar_users(model, movies_df, user_id_input, top_n)
+                    recs_sim_items, favorite_title = recommend_similar_items(model, movies_df, user_id_input, top_n)
 
-            if recs_cf.empty:
-                st.error(f"❌ User ID **{user_id_input}** was not found. Try IDs between 1 and 609.")
-                return
+                    if recs_cf.empty:
+                        st.error(f"❌ User ID **{user_id_input}** was not found. Try IDs between 1 and 609.")
+                    else:
+                        st.markdown(f'<div class="section-label">🎟️ Recommendations Dashboard for User #{user_id_input}</div>', unsafe_allow_html=True)
+                        tab1, tab2, tab3 = st.tabs([
+                            "🎯 Optimized Predictions",
+                            "👥 Similar Users Watched",
+                            "🍿 Because You Liked"
+                        ])
+                        with tab1:
+                            st.caption("Pure Matrix Factorization: Hidden traits matching your profile metrics.")
+                            display_recommendations_grid(recs_cf)
+                        with tab2:
+                            st.caption("Neighborhood Context: Movies loved by people with identical tastes to yours.")
+                            display_recommendations_grid(recs_sim_users, custom_badge="👥 Taste Match")
+                        with tab3:
+                            st.caption(f"Item Vector Context: Similar characteristics to your top-rated film: **{favorite_title}**")
+                            display_recommendations_grid(recs_sim_items, custom_badge="🎬 Item Match")
 
-            st.markdown(f'<div class="section-label">🎟️ Recommendations Dashboard for User #{user_id_input}</div>', unsafe_allow_html=True)
-            
-            # Sub-Tab Layout for existing user contexts
-            tab1, tab2, tab3 = st.tabs([
-                "🎯 Optimized Predictions", 
-                "👥 Similar Users Watched", 
-                "🍿 Because You Liked"
-            ])
-            
-            with tab1:
-                st.caption("Pure Matrix Factorization: Hidden traits matching your profile metrics.")
-                display_recommendations_grid(recs_cf)
-                
-            with tab2:
-                st.caption("Neighborhood Context: Movies loved by people with identical tastes to yours.")
-                display_recommendations_grid(recs_sim_users, custom_badge="👥 Taste Match")
-                
-            with tab3:
-                st.caption(f"Item Vector Context: Similar characteristics to your top-rated film: **{favorite_title}**")
-                display_recommendations_grid(recs_sim_items, custom_badge="🎬 Item Match")
+                else:
+                    if not selected_genres:
+                        st.warning("⚠️ Please select at least one genre to continue.")
+                    else:
+                        recs = recommend_cold_start(movies_df, selected_genres, top_n, match_mode)
+                        if recs.empty:
+                            st.warning("No movies found for the selected genre combination. Try 'any' mode.")
+                        else:
+                            genre_str = ", ".join(selected_genres)
+                            st.markdown(
+                                f'<div class="section-label">🎭 Top {len(recs)} movies for genres: {genre_str}</div>',
+                                unsafe_allow_html=True,
+                            )
+                            display_recommendations_grid(recs)
 
+    # ══════════════════════════════════════════════════════════════════════
+    #  TAB 2 — SEARCH MOVIES
+    # ══════════════════════════════════════════════════════════════════════
+    with page_tab_search:
+        st.markdown(
+            '<div class="section-label">🔍 Search & Explore Movies</div>',
+            unsafe_allow_html=True,
+        )
+
+        # ── Simple search bar (no extra filters) ─────────────────────────
+        scol1, scol2 = st.columns([5, 1])
+        with scol1:
+            search_query = st.text_input(
+                label="search_label",
+                label_visibility="collapsed",
+                placeholder="🔎  Search by movie title… e.g. Inception, Batman, Star Wars",
+                key="search_query_input",
+            )
+        with scol2:
+            run_search = st.button("Search 🔍", key="run_search_btn", type="primary", use_container_width=True)
+
+        # ── Persist results across reruns via session_state ───────────────
+        if run_search:
+            if not search_query.strip():
+                st.warning("⚠️ Please enter a movie title to search.")
+                st.session_state.pop("search_results", None)
+                st.session_state.pop("search_query_used", None)
+            else:
+                with st.spinner("Searching the catalog…"):
+                    results_df = search_movies(
+                        movies_df,
+                        query=search_query,
+                        genres=[],
+                        year_min=1900,
+                        year_max=2025,
+                        min_imdb=0.0,
+                        max_results=16,
+                    )
+                st.session_state["search_results"] = results_df
+                st.session_state["search_query_used"] = search_query
+
+        # ── Display results (persisted in session_state) ──────────────────
+        if "search_results" in st.session_state:
+            results_df = st.session_state["search_results"]
+            used_query = st.session_state.get("search_query_used", "")
+
+            if results_df.empty:
+                st.markdown(
+                    '<div class="no-results-box">'
+                    f'😔 No movies found for <b>"{html.escape(used_query)}"</b>.<br>'
+                    'Try a different title or check your spelling.'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(f"**{len(results_df)} result(s)** for *\"{used_query}\"*")
+
+                # Selectbox for choosing which movie to get recommendations for
+                movie_titles = results_df["title"].tolist()
+                selected_movie_title = st.selectbox(
+                    "🎬 Select a movie to see similar recommendations:",
+                    options=[""] + movie_titles,
+                    format_func=lambda x: "— Pick a movie to get recommendations —" if x == "" else x,
+                    key="selected_search_movie",
+                )
+
+                st.markdown("---")
+
+                # ── Render search result rows ─────────────────────────────
+                st.markdown("**Search Results**")
+                for idx, row in results_df.iterrows():
+                    details = fetch_movie_details(row["title"])
+                    render_search_result_row(row, details, idx)
+
+                # ── Recommended movies for selected title ─────────────────
+                if selected_movie_title:
+                    sel_row = results_df[results_df["title"] == selected_movie_title]
+                    if not sel_row.empty:
+                        sel_movie_id = int(sel_row.iloc[0]["movieId"])
+                        sel_genres   = sel_row.iloc[0].get("genres", "")
+
+                        st.markdown(
+                            f'<div class="similar-header">'
+                            f'🍿 Movies Similar to <em>{html.escape(selected_movie_title)}</em>'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                        with st.spinner("Finding similar movies…"):
+                            sim_recs = recommend_similar_to_movie(
+                                model, movies_df, sel_movie_id, top_n=top_n
+                            )
+
+                        # Fallback to genre-based if movie not in training set
+                        if sim_recs.empty:
+                            genres_list = [
+                                g for g in (sel_genres or "").split("|")
+                                if g and g.lower() != "(no genres listed)"
+                            ]
+                            sim_recs = recommend_cold_start(
+                                movies_df, genres_list, top_n=top_n, match_mode="any"
+                            )
+                            if not sim_recs.empty:
+                                st.caption(
+                                    "ℹ️ This title isn't in the training set — "
+                                    "showing genre-based similar movies instead."
+                                )
+
+                        if sim_recs.empty:
+                            st.info("No similar movies found. Try selecting a different title.")
+                        else:
+                            display_recommendations_grid(sim_recs, custom_badge="🎬 Similar")
         else:
-            if not selected_genres:
-                st.warning("⚠️ Please select at least one genre to continue.")
-                return
-
-            recs = recommend_cold_start(movies_df, selected_genres, top_n, match_mode)
-            if recs.empty:
-                st.warning("No movies found for the selected genre combination. Try 'any' mode.")
-                return
-
-            genre_str = ", ".join(selected_genres)
             st.markdown(
-                f'<div class="section-label">🎭 Top {len(recs)} movies for genres: {genre_str}</div>',
+                '<div class="info-box">'
+                '🔎 <b>Type any movie title</b> above and hit <b>Search</b> to explore the catalog.<br><br>'
+                '🍿 After results appear, <b>select any movie</b> from the dropdown '
+                'to instantly see its most similar recommendations powered by SVD item vectors.'
+                '</div>',
                 unsafe_allow_html=True,
             )
-            display_recommendations_grid(recs)
 
     st.markdown("---")
     st.markdown(
