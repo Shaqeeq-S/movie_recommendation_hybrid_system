@@ -182,6 +182,17 @@ def load_movies():
 
 
 @st.cache_data(show_spinner=False)
+def load_item_similarity_matrix():
+    import os
+    import gdown
+    url = "https://drive.google.com/uc?id=1adLQxd6s3Rj9_8aW4Db1LvB-Q27PT3c4"
+    dest = "item_similarity_matrix_downloaded.csv"
+    if not os.path.exists(dest):
+        gdown.download(url, dest, quiet=False)
+    return pd.read_csv(dest, index_col=0)
+
+
+@st.cache_data(show_spinner=False)
 def get_all_genres(_movies_df: pd.DataFrame) -> list[str]:
     genres = set()
     for g_string in _movies_df["genres"].dropna():
@@ -542,6 +553,40 @@ def recommend_similar_to_movie(
     return result.reset_index(drop=True)
 
 
+def recommend_similar_to_movie_from_matrix(
+    similarity_df: pd.DataFrame,
+    movies_df: pd.DataFrame,
+    movie_title: str,
+    top_n: int = 8,
+) -> pd.DataFrame:
+    """
+    Finds similar movies using the precomputed item similarity matrix.
+    """
+    if movie_title not in similarity_df.index:
+        return pd.DataFrame()
+
+    sim_scores = similarity_df.loc[movie_title]
+    
+    if movie_title in sim_scores.index:
+        sim_scores = sim_scores.drop(movie_title)
+    
+    # Remove any duplicate index labels from the matrix to avoid reindexing errors
+    sim_scores = sim_scores[~sim_scores.index.duplicated()]
+    sim_scores = sim_scores.sort_values(ascending=False).head(top_n)
+
+    result = movies_df[movies_df["title"].isin(sim_scores.index)].copy()
+    # Drop any duplicate movie titles from the dataframe
+    result = result.drop_duplicates(subset=["title"])
+    result["predicted_score"] = None
+    
+    # Sort the results to match the similarity scores order
+    sim_order = {title: i for i, title in enumerate(sim_scores.index)}
+    result["_order"] = result["title"].map(sim_order)
+    result = result.sort_values("_order").drop(columns=["_order"]).reset_index(drop=True)
+    
+    return result
+
+
 # ── ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ──
 #  SEARCH RESULT ROW RENDERER
 # ── ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ──
@@ -742,6 +787,7 @@ def main():
     movies_df = load_movies()
     model = load_model()
     all_genres = get_all_genres(movies_df)
+    item_sim_df = load_item_similarity_matrix()
 
     st.markdown('<h1 class="hero-title">🎬 CineMatch</h1>', unsafe_allow_html=True)
     st.markdown(
@@ -945,8 +991,8 @@ def main():
                         )
 
                         with st.spinner("Finding similar movies…"):
-                            sim_recs = recommend_similar_to_movie(
-                                model, movies_df, sel_movie_id, top_n=top_n
+                            sim_recs = recommend_similar_to_movie_from_matrix(
+                                item_sim_df, movies_df, selected_movie_title, top_n=top_n
                             )
 
                         # Fallback to genre-based if movie not in training set
