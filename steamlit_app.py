@@ -183,13 +183,7 @@ def load_movies():
 
 @st.cache_data(show_spinner=False)
 def load_item_similarity_matrix():
-    import os
-    import gdown
-    url = "https://drive.google.com/uc?id=1adLQxd6s3Rj9_8aW4Db1LvB-Q27PT3c4"
-    dest = "item_similarity_matrix_downloaded.csv"
-    if not os.path.exists(dest):
-        gdown.download(url, dest, quiet=False)
-    return pd.read_csv(dest, index_col=0)
+    return pd.read_csv("item_similarity_matrix_downloaded.csv", index_col=0)
 
 
 @st.cache_data(show_spinner=False)
