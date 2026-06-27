@@ -181,9 +181,10 @@ def load_movies():
     return pd.read_pickle(MOVIES_PATH)
 
 
-@st.cache_data(show_spinner=False)
-def load_item_similarity_matrix():
-    return pd.read_csv("item_similarity_matrix_downloaded.csv", index_col=0)
+@st.cache_resource(show_spinner=False)
+def load_compact_similarities():
+    # Loads instantly, takes almost 0 RAM
+    return joblib.load("item_item.joblib")
 
 
 @st.cache_data(show_spinner=False)
@@ -548,38 +549,29 @@ def recommend_similar_to_movie(
 
 
 def recommend_similar_to_movie_from_matrix(
-    similarity_df: pd.DataFrame,
-    movies_df: pd.DataFrame,
-    movie_title: str,
-    top_n: int = 8,
-) -> pd.DataFrame:
-    """
-    Finds similar movies using the precomputed item similarity matrix.
-    """
-    if movie_title not in similarity_df.index:
+    similarity_dict,
+    movies_df,
+    movie_title,
+    top_n ,
+):
+    if movie_title not in similarity_dict:
         return pd.DataFrame()
 
-    sim_scores = similarity_df.loc[movie_title]
-    
-    if movie_title in sim_scores.index:
-        sim_scores = sim_scores.drop(movie_title)
-    
-    # Remove any duplicate index labels from the matrix to avoid reindexing errors
-    sim_scores = sim_scores[~sim_scores.index.duplicated()]
-    sim_scores = sim_scores.sort_values(ascending=False).head(top_n)
+    # Slice the precomputed top 50 down to whatever top_n the user chose (e.g., 8)
+    top_matches = similarity_dict[movie_title][:top_n]
+    similar_titles = [title for title, score in top_matches]
 
-    result = movies_df[movies_df["title"].isin(sim_scores.index)].copy()
-    # Drop any duplicate movie titles from the dataframe
+    # Map back to your main movies dataframe
+    result = movies_df[movies_df["title"].isin(similar_titles)].copy()
     result = result.drop_duplicates(subset=["title"])
     result["predicted_score"] = None
     
-    # Sort the results to match the similarity scores order
-    sim_order = {title: i for i, title in enumerate(sim_scores.index)}
+    # Keep the exact sorted order of similarity
+    sim_order = {title: i for i, title in enumerate(similar_titles)}
     result["_order"] = result["title"].map(sim_order)
     result = result.sort_values("_order").drop(columns=["_order"]).reset_index(drop=True)
     
     return result
-
 
 # ── ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ──
 #  SEARCH RESULT ROW RENDERER
@@ -781,7 +773,7 @@ def main():
     movies_df = load_movies()
     model = load_model()
     all_genres = get_all_genres(movies_df)
-    item_sim_df = load_item_similarity_matrix()
+    item_sim_df = load_compact_similarities()
 
     st.markdown('<h1 class="hero-title">🎬 CineMatch</h1>', unsafe_allow_html=True)
     st.markdown(
